@@ -10,25 +10,18 @@ from psycopg2 import Error
 import pandas as pd
 
 # Validates if there are files in the S3 bucket
-def check_s3_bucket(**kwargs):
+def validate_streams_in_s3(**kwargs):
     s3_hook = S3Hook(aws_conn_id='aws_default')  # Uses AWS connection stored in Airflow UI
     bucket_name = 'streaming-data-nsp24'
     objects = s3_hook.list_keys(bucket_name=bucket_name)
     
     if objects:
-        kwargs['ti'].xcom_push(key='files_exist', value=True)
+        return 'extract_and_combine_streams'
     else:
-        kwargs['ti'].xcom_push(key='files_exist', value=False)
-
-# Decides the next task based on the files in the S3 bucket
-def decide_next_task(**kwargs):
-    ti = kwargs['ti']
-    files_exist = ti.xcom_pull(task_ids='check_s3_bucket', key='files_exist')
-    
-    return 'extract_and_combine_files' if files_exist else 'end_dag_if_no_files_in_s3'
+        return 'end_dag_if_no_streams_exists_task'
 
 # Extracts and combines the files from the S3 bucket
-def extract_and_combine_files(**kwargs):
+def extract_and_combine_streams(**kwargs):
     s3_hook = S3Hook(aws_conn_id='aws_default')
     bucket_name = 'streaming-data-nsp24'
     objects = s3_hook.list_keys(bucket_name=bucket_name)
@@ -38,37 +31,19 @@ def extract_and_combine_files(**kwargs):
         file_content = s3_hook.read_key(key=file_key, bucket_name=bucket_name)
         combined_data.append(file_content)
     
+    print(f"Extracted {len(combined_data)} records from S3.")
     combined_file_path = '/tmp/combined_streaming_data.csv'
     with open(combined_file_path, 'w') as f:
         f.write('\n'.join(combined_data))
     
     kwargs['ti'].xcom_push(key='combined_file_path', value=combined_file_path)
 
-# Validates if all required columns are present in the combined data
-def validate_columns(**kwargs):
-    ti = kwargs['ti']
-    combined_file_path = ti.xcom_pull(task_ids='extract_and_combine_files', key='combined_file_path')
-    
-    # Read the combined file into a DataFrame
-    df = pd.read_csv(combined_file_path)
-    
-    # Define the required columns
-    required_columns = {'user_id', 'track_id', 'listen_time'}
-    
-    # Check if all required columns are present
-    if not required_columns.issubset(df.columns):
-        missing_columns = required_columns - set(df.columns)
-        print(f"Missing required columns: {missing_columns}")
-        return 'end_dag'  # End the DAG if columns are missing
-    
-    # If all columns are present, log a success message
-    print("All required columns are present in the combined data.")
-    return 'transform_data'  # Proceed to the next task if columns are present
 
 # Extracting songs and users data from postgres
 def extract_users_and_songs_from_postgres(**kwargs):
 
     # Establish connection to the database
+    cursor = None
     try:
         # Get RDS connection details from Airflow Connections
         rds_conn = BaseHook.get_connection("aws_postgres_conn")
@@ -118,6 +93,54 @@ def extract_users_and_songs_from_postgres(**kwargs):
         if conn:
             conn.close()
 
+# Validates if all required columns are present in the combined stream data, users and songs
+def validate_columns(**kwargs):
+    ti = kwargs['ti']
+    
+    # Pull file paths from XCom
+    combined_streams_path = ti.xcom_pull(task_ids='extract_and_combine_streams', key='combined_file_path')
+    users_csv_path = ti.xcom_pull(task_ids='extract_users_and_songs_from_postgres', key='users_csv_path')
+    songs_csv_path = ti.xcom_pull(task_ids='extract_users_and_songs_from_postgres', key='songs_csv_path')
+    
+    # Read the CSV files into DataFrames
+    streams_df = pd.read_csv(combined_streams_path)
+    users_df = pd.read_csv(users_csv_path)
+    songs_df = pd.read_csv(songs_csv_path)
+    
+    # Define the required columns for each dataset
+    required_columns_streams = {'user_id', 'track_id', 'listen_time'}
+    required_columns_users = {'user_id', 'user_name', 'user_age', 'user_country', 'created_at'}
+    required_columns_songs = {
+        'track_id', 'artists', 'album_name', 'track_name', 'popularity', 'duration_ms', 'explicit',
+        'danceability', 'energy', 'song_key', 'loudness', 'mode', 'speechiness', 'acousticness',
+        'instrumentalness', 'liveness', 'valence', 'tempo', 'time_signature', 'track_genre'
+    }
+    
+    # Validate streams data
+    if not required_columns_streams.issubset(streams_df.columns):
+        missing_columns = required_columns_streams - set(streams_df.columns)
+        print(f"Missing required columns in streams data: {missing_columns}")
+        return 'end_dag_if_columns_missing'  # End the DAG if streams validation fails
+    
+    # Validate users data
+    if not required_columns_users.issubset(users_df.columns):
+        missing_columns = required_columns_users - set(users_df.columns)
+        print(f"Missing required columns in users data: {missing_columns}")
+        return 'end_dag_if_columns_missing'  # End the DAG if users validation fails
+    
+    # Validate songs data
+    if not required_columns_songs.issubset(songs_df.columns):
+        missing_columns = required_columns_songs - set(songs_df.columns)
+        print(f"Missing required columns in songs data: {missing_columns}")
+        return 'end_dag_if_columns_missing'  # End the DAG if songs validation fails
+    
+    # If all validations pass, log a success message
+    print("All required columns are present in streams, users, and songs data.")
+    print(f"Extracted {len(streams_df)} records from S3.")
+    print(f"Extracted {len(users_df)} records from Postgres.")
+    print(f"Extracted {len(songs_df)} records from Postgres.")
+    return 'transform_data'  # Proceed to the next task if all validations succeed
+
 # Transformation task (placeholder)
 def transform_data(**kwargs):
     print("Transforming data...")
@@ -147,49 +170,36 @@ dag = DAG(
     schedule_interval=timedelta(days=1),
 )
 
-# Validate if there are stream files in the S3 bucket task
-check_s3_bucket_task = PythonOperator(
-    task_id='check_s3_bucket',
-    python_callable=check_s3_bucket,
-    dag=dag,
-)
-
 # Branching based on the presence of files in the S3 bucket task
-branch_task = BranchPythonOperator(
-    task_id='branch_task',
-    python_callable=decide_next_task,
+validate_streams_in_s3_task = BranchPythonOperator(
+    task_id='validating_streams_in_s3',
+    python_callable=validate_streams_in_s3,
     dag=dag,
 )
 
 # Stopping the DAG if there are no files in the S3 bucket task
-end_dag_task_if_no_files_exists = EmptyOperator(
-    task_id='end_dag_if_no_files_in_s3',
+end_dag_if_no_streams_exists_task = EmptyOperator(
+    task_id='end_dag_if_no_streams_exists_in_s3',
     dag=dag,
 )
 
 # Extracting and combining streams from the S3 bucket task
 extract_and_combine_streams_task = PythonOperator(
     task_id='extract_and_combine_streams',
-    python_callable=extract_and_combine_files,
+    python_callable=extract_and_combine_streams,
     dag=dag,
 )
 
-# Validate if all required columns are present in the combined stream data task
-validate_columns_task = PythonOperator(
+
+# Branching based on the validation of columns task
+validate_columns_task = BranchPythonOperator(
     task_id='validate_columns',
     python_callable=validate_columns,
     dag=dag,
 )
 
-# Branching based on the validation of columns task
-branch_after_validation_task = BranchPythonOperator(
-    task_id='branch_after_validation',
-    python_callable=validate_columns,
-    dag=dag,
-)
-
 # Stop the DAG if required columns are missing
-end_dag_task = EmptyOperator(
+end_dag_if_columns_missing_task = EmptyOperator(
     task_id='end_dag_if_columns_missing',
     dag=dag,
 )
@@ -208,12 +218,11 @@ transform_data_task = PythonOperator(
 )
 
 # Define task dependencies
-check_s3_bucket_task >> branch_task
-branch_task >> extract_and_combine_files_task
-branch_task >> end_dag_task_if_no_files_exists
-extract_and_combine_files_task >> validate_columns_task
-validate_columns_task >> branch_after_validation_task
-branch_after_validation_task >> transform_data_task
-branch_after_validation_task >> end_dag_task
+validate_streams_in_s3_task >> extract_and_combine_streams_task
+validate_streams_in_s3_task >> end_dag_if_no_streams_exists_task
 
-extract_users_and_songs_from_postgres_task >> transform_data_task
+extract_and_combine_streams_task >> validate_columns_task
+extract_users_and_songs_from_postgres_task >> validate_columns_task
+
+validate_columns_task >> transform_data_task 
+validate_columns_task >> end_dag_if_columns_missing_task
