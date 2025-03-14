@@ -4,6 +4,7 @@ from airflow.operators.empty import EmptyOperator
 from airflow.utils.dates import days_ago
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.hooks.base_hook import BaseHook
+from airflow.providers.amazon.aws.hooks.redshift_sql import RedshiftSQLHook
 from datetime import timedelta
 import psycopg2
 from psycopg2 import Error
@@ -58,6 +59,7 @@ def extract_users_and_songs_from_postgres(**kwargs):
         print("Connected to the database.")
 
         # Extract users data
+        print("Extracting users data...")
         users_query = "SELECT * FROM users"
         cursor.execute(users_query)
         users_rows = cursor.fetchall()
@@ -72,6 +74,7 @@ def extract_users_and_songs_from_postgres(**kwargs):
         kwargs['ti'].xcom_push(key='users_csv_path', value=users_csv_path)
 
         # Extract songs data
+        print("Extracting songs data...")
         songs_query = "SELECT * FROM songs"
         cursor.execute(songs_query)
         songs_rows = cursor.fetchall()
@@ -139,12 +142,114 @@ def validate_columns(**kwargs):
     print(f"Extracted {len(streams_df)} records from S3.")
     print(f"Extracted {len(users_df)} records from Postgres.")
     print(f"Extracted {len(songs_df)} records from Postgres.")
-    return 'transform_data'  # Proceed to the next task if all validations succeed
+    return 'transform_and_compute_kpis'  # Proceed to the next task if all validations succeed
 
 # Transformation task (placeholder)
-def transform_data(**kwargs):
+def transform_and_compute_kpis(**kwargs):
     print("Transforming data...")
-    # Add your transformation logic here
+    ti = kwargs['ti']
+    
+    # Pull file paths from XCom
+    combined_streams_path = ti.xcom_pull(task_ids='extract_and_combine_streams', key='combined_file_path')
+    users_csv_path = ti.xcom_pull(task_ids='extract_users_and_songs_from_postgres', key='users_csv_path')
+    songs_csv_path = ti.xcom_pull(task_ids='extract_users_and_songs_from_postgres', key='songs_csv_path')
+    
+    # Read the CSV files into DataFrames
+    streams_df = pd.read_csv(combined_streams_path)
+    users_df = pd.read_csv(users_csv_path)
+    songs_df = pd.read_csv(songs_csv_path)
+
+    # Convert 'listen_time' to datetime as a string
+    streams_df['listen_time'] = streams_df['listen_time'].astype(str)
+    streams_df["listen_time"] = pd.to_datetime(streams_df["listen_time"], errors="coerce").astype(str)
+    
+    # Merge streams with songs to get genre information
+    merged_df = pd.merge(streams_df, songs_df, left_on='track_id', right_on='track_id', how='left')
+    
+    # Extract date and hour from the listen_time column
+    merged_df['date'] = pd.to_datetime(merged_df['listen_time']).dt.date
+    merged_df['hour'] = pd.to_datetime(merged_df['listen_time']).dt.hour
+    
+    # Genre-Level KPIs (Daily Basis)
+    genre_kpis = merged_df.groupby(['date', 'track_genre']).agg(
+        listen_count=('track_id', 'count'),  # Total listen count per genre per day
+        avg_duration_ms=('duration_ms', 'mean'),  # Average track duration per genre per day
+        popularity_index=('popularity', 'mean')  # Average popularity index per genre per day
+    ).reset_index()
+    
+    # Compute the most popular track per genre per day
+    most_popular_track_per_genre_per_day = (
+        merged_df.loc[merged_df.groupby(['date', 'track_genre'])['popularity'].idxmax()]
+        [['date', 'track_genre', 'track_name', 'popularity']]
+    )
+    
+    # Merge the most popular track information into the genre_kpis table
+    genre_kpis = pd.merge(
+        genre_kpis,
+        most_popular_track_per_genre_per_day,
+        on=['date', 'track_genre'],
+        how='left'
+    )
+    
+    # Rename columns for clarity
+    genre_kpis.rename(columns={
+        'track_name': 'most_popular_track',
+        'popularity': 'most_popular_track_popularity'
+    }, inplace=True)
+
+    # Save Genre-Level KPIs to a CSV file
+    genre_kpis_csv_path = '/tmp/genre_kpis_daily.csv'
+    genre_kpis.to_csv(genre_kpis_csv_path, index=False)
+    
+    # Log the results
+    print("Genre-Level KPIs computed and saved to CSV file.")
+    print(f"Genre KPIs saved to: {genre_kpis_csv_path}")
+    
+    # Push the file path to XCom for use in downstream tasks
+    ti.xcom_push(key='genre_kpis_csv_path', value=genre_kpis_csv_path)
+
+    # Hourly KPIs (Daily Basis)
+    hourly_kpis = merged_df.groupby(['date', 'hour']).agg(
+        unique_listeners=('user_id', 'nunique'),  # Unique listeners per hour per day
+        total_plays=('track_id', 'count'),  # Total plays per hour per day
+        unique_tracks=('track_id', 'nunique')  # Unique tracks per hour per day
+    ).reset_index()
+    
+    # Compute Track Diversity Index
+    hourly_kpis['track_diversity_index'] = hourly_kpis['unique_tracks'] / hourly_kpis['total_plays']
+    
+    # Compute Top Artists per Hour
+    top_artists_per_hour = (
+        merged_df.groupby(['date', 'hour', 'artists'])['track_id']
+        .count()
+        .reset_index(name='play_count')
+        .sort_values(['date', 'hour', 'play_count'], ascending=[True, True, False])
+        .groupby(['date', 'hour'])
+        .head(1)
+        .rename(columns={'artists': 'top_artist', 'play_count': 'top_artist_plays'})
+    )
+    
+    # Merge Top Artists into the hourly_kpis table
+    hourly_kpis = pd.merge(
+        hourly_kpis,
+        top_artists_per_hour[['date', 'hour', 'top_artist']],  # Only include 'top_artist' column
+        on=['date', 'hour'],
+        how='left'
+    )
+    
+    # Select only the required columns for the final hourly KPIs table
+    hourly_kpis = hourly_kpis[['date', 'hour', 'unique_listeners', 'top_artist', 'track_diversity_index']]
+    
+    # Save Hourly KPIs to a CSV file
+    hourly_kpis_csv_path = '/tmp/hourly_kpis_daily.csv'
+    hourly_kpis.to_csv(hourly_kpis_csv_path, index=False)
+    
+    # Log the results
+    print("Hourly KPIs computed and saved to CSV file.")
+    print(f"Hourly KPIs saved to: {hourly_kpis_csv_path}")
+    
+    # Push the file path to XCom for use in downstream tasks
+    ti.xcom_push(key='hourly_kpis_csv_path', value=hourly_kpis_csv_path)
 
 
 # ------------------------------------------------------------------------------------------------
@@ -211,18 +316,20 @@ extract_users_and_songs_from_postgres_task = PythonOperator(
     dag=dag,
 )
 
-transform_data_task = PythonOperator(
-    task_id='transform_data',
-    python_callable=transform_data,
+# Transformation and KPI computation task
+transform_and_compute_kpis_task = PythonOperator(
+    task_id='transform_and_compute_kpis',
+    python_callable=transform_and_compute_kpis,
     dag=dag,
 )
 
-# Define task dependencies
+# Task dependencies
 validate_streams_in_s3_task >> extract_and_combine_streams_task
 validate_streams_in_s3_task >> end_dag_if_no_streams_exists_task
 
 extract_and_combine_streams_task >> validate_columns_task
 extract_users_and_songs_from_postgres_task >> validate_columns_task
 
-validate_columns_task >> transform_data_task 
+validate_columns_task >> transform_and_compute_kpis_task 
 validate_columns_task >> end_dag_if_columns_missing_task
+
