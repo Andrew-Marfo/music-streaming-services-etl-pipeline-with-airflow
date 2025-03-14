@@ -5,6 +5,7 @@ from airflow.utils.dates import days_ago
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.hooks.base_hook import BaseHook
 from airflow.providers.amazon.aws.hooks.redshift_sql import RedshiftSQLHook
+from airflow.providers.postgres.hooks.postgres import PostgresHook
 from datetime import timedelta
 import psycopg2
 from psycopg2 import Error
@@ -42,19 +43,10 @@ def extract_and_combine_streams(**kwargs):
 
 # Extracting songs and users data from postgres
 def extract_users_and_songs_from_postgres(**kwargs):
-
-    # Establish connection to the database
-    cursor = None
     try:
         # Get RDS connection details from Airflow Connections
-        rds_conn = BaseHook.get_connection("aws_postgres_conn")
-        conn = psycopg2.connect(
-            host=rds_conn.host,
-            user=rds_conn.login,
-            password=rds_conn.password,
-            dbname=rds_conn.schema,
-            port=rds_conn.port
-        )
+        postgres_hook = PostgresHook(postgres_conn_id="aws_postgres_conn")  # Use PostgresHook
+        conn = postgres_hook.get_conn()
         cursor = conn.cursor()
         print("Connected to the database.")
 
@@ -88,7 +80,7 @@ def extract_users_and_songs_from_postgres(**kwargs):
         # Push the songs file path to XCom
         kwargs['ti'].xcom_push(key='songs_csv_path', value=songs_csv_path)
 
-    except Error as e:
+    except Exception as e:
         print(f"Error: {e}")
     finally:
         if cursor:
@@ -251,11 +243,118 @@ def transform_and_compute_kpis(**kwargs):
     # Push the file path to XCom for use in downstream tasks
     ti.xcom_push(key='hourly_kpis_csv_path', value=hourly_kpis_csv_path)
 
+# Task to create tables in Redshift if they don't exist
+def create_redshift_tables_if_not_exists(**kwargs):
+    redshift_hook = RedshiftSQLHook(redshift_conn_id='aws_redshift_conn')  # Use RedshiftSQLHook
+    conn = redshift_hook.get_conn()
+    cursor = conn.cursor()
+
+    # SQL to create genre_kpis table
+    create_genre_kpis_table_sql = """
+    CREATE TABLE IF NOT EXISTS genre_kpis (
+        date DATE,
+        track_genre VARCHAR(255),
+        listen_count INT,
+        avg_duration_ms FLOAT,
+        popularity_index FLOAT,
+        most_popular_track VARCHAR(255),
+        most_popular_track_popularity FLOAT
+    );
+    """
+
+    # SQL to create hourly_kpis table
+    create_hourly_kpis_table_sql = """
+    CREATE TABLE IF NOT EXISTS hourly_kpis (
+        date DATE,
+        hour VARCHAR(255),
+        unique_listeners INT,
+        top_artist VARCHAR(255),
+        track_diversity_index FLOAT
+    );
+    """
+
+    try:
+        # Execute the SQL to create tables
+        redshift_hook.run(create_genre_kpis_table_sql)  # Use run() method for executing SQL
+        redshift_hook.run(create_hourly_kpis_table_sql)
+        print("Tables created successfully in Redshift (if they didn't exist).")
+    except Exception as e:
+        print(f"Error creating tables in Redshift: {e}")
+    finally:
+        cursor.close()
+        conn.close()
+
+# Upload kpis to s3
+def upload_csv_to_s3(**kwargs):
+    ti = kwargs['ti']
+
+    # Pull file paths from XCom
+    genre_kpis_csv_path = ti.xcom_pull(task_ids='transform_and_compute_kpis', key='genre_kpis_csv_path')
+    hourly_kpis_csv_path = ti.xcom_pull(task_ids='transform_and_compute_kpis', key='hourly_kpis_csv_path')
+
+    s3_hook = S3Hook(aws_conn_id='aws_default')
+    bucket_name = 'kpis-intermediate-bucket'  # Replace with your S3 bucket name
+
+    # Upload genre_kpis CSV to S3
+    s3_hook.load_file(
+        filename=genre_kpis_csv_path,
+        key='genre_kpis.csv',  # S3 object key
+        bucket_name=bucket_name,
+        replace=True
+    )
+    print("Genre KPIs CSV uploaded to S3.")
+
+    # Upload hourly_kpis CSV to S3
+    s3_hook.load_file(
+        filename=hourly_kpis_csv_path,
+        key='hourly_kpis.csv',  # S3 object key
+        bucket_name=bucket_name,
+        replace=True
+    )
+    print("Hourly KPIs CSV uploaded to S3.")
+
+# Task to load data into Redshift
+def load_data_into_redshift(**kwargs):
+
+    # Get Redshift connection details from Airflow connection
+    redshift_hook = PostgresHook(postgres_conn_id='aws_redshift_conn')
+    conn = redshift_hook.get_conn()
+    cursor = conn.cursor()
+
+    bucket_name = 'kpis-intermediate-bucket'  # Ensure no trailing space
+    iam_role = 'arn:aws:iam::195275667627:role/service-role/AmazonRedshift-CommandsAccessRole-20250314T123906'
+
+    try:
+        # Load genre_kpis data into Redshift
+        cursor.execute(f"""
+            COPY genre_kpis
+            FROM 's3://{bucket_name}/genre_kpis.csv'
+            IAM_ROLE '{iam_role}'
+            FORMAT CSV
+            IGNOREHEADER 1;
+        """)
+        print("Genre KPIs data loaded into Redshift.")
+
+        # Load hourly_kpis data into Redshift
+        cursor.execute(f"""
+            COPY hourly_kpis
+            FROM 's3://{bucket_name}/hourly_kpis.csv'
+            IAM_ROLE '{iam_role}'
+            FORMAT CSV
+            IGNOREHEADER 1;
+        """)
+        print("Hourly KPIs data loaded into Redshift.")
+
+        conn.commit()
+    except Exception as e:
+        print(f"Error loading data into Redshift: {e}")
+    finally:
+        cursor.close()
+        conn.close()
 
 # ------------------------------------------------------------------------------------------------
 
 # Dag definition and task dependencies
-
 
 
 # Define default arguments for the DAG
@@ -323,6 +422,27 @@ transform_and_compute_kpis_task = PythonOperator(
     dag=dag,
 )
 
+# Task to create tables in Redshift
+create_redshift_tables_task = PythonOperator(
+    task_id='create_redshift_tables',
+    python_callable=create_redshift_tables_if_not_exists,
+    dag=dag,
+)
+
+# Task to upload CSV files to S3
+upload_csv_to_s3_task = PythonOperator(
+    task_id='upload_csv_to_s3',
+    python_callable=upload_csv_to_s3,
+    dag=dag,
+)
+
+# Task to load data into Redshift
+load_data_into_redshift_task = PythonOperator(
+    task_id='load_data_into_redshift',
+    python_callable=load_data_into_redshift,
+    dag=dag,
+)
+
 # Task dependencies
 validate_streams_in_s3_task >> extract_and_combine_streams_task
 validate_streams_in_s3_task >> end_dag_if_no_streams_exists_task
@@ -332,4 +452,4 @@ extract_users_and_songs_from_postgres_task >> validate_columns_task
 
 validate_columns_task >> transform_and_compute_kpis_task 
 validate_columns_task >> end_dag_if_columns_missing_task
-
+transform_and_compute_kpis_task >> create_redshift_tables_task >> upload_csv_to_s3_task >> load_data_into_redshift_task
